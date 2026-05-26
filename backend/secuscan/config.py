@@ -55,6 +55,7 @@ class Settings(BaseSettings):
     plugin_signature_key: Optional[str] = None
     enforce_plugin_signatures: bool = False
     vault_key: Optional[str] = None
+    vault_key_previous: Optional[str] = None
     
     # Rate Limiting
     max_concurrent_tasks: int = 3
@@ -98,6 +99,17 @@ class Settings(BaseSettings):
         """Return a deterministic 32-byte key for credential vault encryption."""
         seed = self.vault_key or self.plugin_signature_key or "secuscan-dev-key"
         digest = hashlib.sha256(seed.encode("utf-8")).digest()
+        return base64.urlsafe_b64encode(digest)
+
+    @property
+    def resolved_vault_key_previous(self) -> Optional[bytes]:
+        """Return the previous vault key seed, encoded similarly to `resolved_vault_key`.
+
+        This can be None if no previous key is configured.
+        """
+        if not self.vault_key_previous:
+            return None
+        digest = hashlib.sha256(self.vault_key_previous.encode("utf-8")).digest()
         return base64.urlsafe_b64encode(digest)
     
     def ensure_directories(self) -> None:

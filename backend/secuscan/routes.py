@@ -894,20 +894,22 @@ async def upsert_vault_secret(name: str, payload: Dict[str, str]):
         raise HTTPException(status_code=400, detail="Secret value is required")
 
     db = await get_db()
-    crypto = VaultCrypto(settings.resolved_vault_key)
+    # Use the resolved current/previous keys to create a version-aware encryptor
+    prev = settings.resolved_vault_key_previous
+    crypto = VaultCrypto(settings.resolved_vault_key, previous_keys=[prev] if prev else None)
     encrypted = crypto.encrypt(value)
     secret_id = str(uuid.uuid4())
 
     existing = await db.fetchone("SELECT id FROM credential_vault WHERE name = ?", (name,))
     if existing:
         await db.execute(
-            "UPDATE credential_vault SET encrypted_value = ?, updated_at = datetime('now') WHERE name = ?",
-            (encrypted, name),
+            "UPDATE credential_vault SET encrypted_value = ?, key_version = ?, updated_at = datetime('now') WHERE name = ?",
+            (encrypted, crypto.version, name),
         )
     else:
         await db.execute(
-            "INSERT INTO credential_vault (id, name, encrypted_value) VALUES (?, ?, ?)",
-            (secret_id, name, encrypted),
+            "INSERT INTO credential_vault (id, name, encrypted_value, key_version) VALUES (?, ?, ?, ?)",
+            (secret_id, name, encrypted, crypto.version),
         )
     return {"name": name, "stored": True}
 
@@ -915,11 +917,17 @@ async def upsert_vault_secret(name: str, payload: Dict[str, str]):
 @router.get("/vault/{name}")
 async def get_vault_secret(name: str):
     db = await get_db()
-    row = await db.fetchone("SELECT encrypted_value FROM credential_vault WHERE name = ?", (name,))
+    row = await db.fetchone("SELECT encrypted_value, key_version FROM credential_vault WHERE name = ?", (name,))
     if not row:
         raise HTTPException(status_code=404, detail="Secret not found")
-    crypto = VaultCrypto(settings.resolved_vault_key)
-    return {"name": name, "value": crypto.decrypt(row["encrypted_value"])}
+    prev = settings.resolved_vault_key_previous
+    crypto = VaultCrypto(settings.resolved_vault_key, previous_keys=[prev] if prev else None)
+    try:
+        value = crypto.decrypt(row["encrypted_value"])
+    except Exception as e:
+        logger.exception("Failed to decrypt vault secret %s: %s", name, e)
+        raise HTTPException(status_code=500, detail="Failed to decrypt secret")
+    return {"name": name, "value": value}
 
 
 @router.delete("/vault/{name}")
@@ -927,6 +935,62 @@ async def delete_vault_secret(name: str):
     db = await get_db()
     await db.execute("DELETE FROM credential_vault WHERE name = ?", (name,))
     return {"name": name, "deleted": True}
+
+
+@router.post("/vault/rotate")
+async def rotate_vault_keys():
+    """Rotate all credential_vault entries to the current configured key.
+
+    This endpoint does NOT accept keys in the request body. An operator must
+    configure the previous key via `SECUSCAN_VAULT_KEY_PREVIOUS` in the
+    environment before invoking this endpoint. The operation is transactional
+    and will roll back if any entry cannot be decrypted.
+    """
+    # Require previous key to be configured; we intentionally avoid accepting
+    # the previous key in the request body to reduce accidental leakage.
+    if not settings.resolved_vault_key_previous:
+        raise HTTPException(status_code=400, detail="Previous vault key not configured (set SECUSCAN_VAULT_KEY_PREVIOUS)")
+
+    db = await get_db()
+
+    current_key = settings.resolved_vault_key
+    prev_key = settings.resolved_vault_key_previous
+    crypto = VaultCrypto(current_key, previous_keys=[prev_key])
+
+    conn = db.connection
+    try:
+        # Begin transaction
+        await conn.execute("BEGIN")
+        rows = await db.fetchall("SELECT id, encrypted_value, key_version FROM credential_vault")
+        updated = 0
+        for r in rows:
+            try:
+                # Attempt to decrypt using known keys
+                plaintext = crypto.decrypt(r["encrypted_value"])
+            except Exception:
+                # Abort and rollback on any undecryptable record
+                await conn.execute("ROLLBACK")
+                raise HTTPException(status_code=500, detail=f"Rotation aborted: unable to decrypt record {r['id']}")
+
+            new_blob = crypto.encrypt(plaintext)
+            await conn.execute(
+                "UPDATE credential_vault SET encrypted_value = ?, key_version = ?, updated_at = datetime('now') WHERE id = ?",
+                (new_blob, crypto.version, r["id"]),
+            )
+            updated += 1
+
+        await conn.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        try:
+            await conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        logger.exception("Vault rotation failed: %s", e)
+        raise HTTPException(status_code=500, detail="Vault rotation failed")
+
+    return {"rotated": updated}
 
 
 @router.get("/workflows")

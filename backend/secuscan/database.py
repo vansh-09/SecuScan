@@ -157,6 +157,7 @@ class Database:
                 id TEXT PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
                 encrypted_value TEXT NOT NULL,
+                key_version INTEGER NOT NULL DEFAULT 1,
                 created_at TIMESTAMP NOT NULL DEFAULT (datetime('now')),
                 updated_at TIMESTAMP NOT NULL DEFAULT (datetime('now'))
             );
@@ -214,6 +215,23 @@ class Database:
                 print("Added missing column 'proof' to findings table.")
             except Exception as e:
                 print(f"Failed to add 'proof' to findings: {e}")
+
+        # credential_vault migration: ensure key_version column exists and
+        # backfill older rows with default value to avoid mixed/NULL states.
+        vault_columns = await self.fetchall("PRAGMA table_info(credential_vault)")
+        existing_vault_cols = {col["name"] for col in vault_columns}
+        if "key_version" not in existing_vault_cols:
+            try:
+                await self.execute("ALTER TABLE credential_vault ADD COLUMN key_version INTEGER NOT NULL DEFAULT 1")
+                print("Added missing column 'key_version' to credential_vault table.")
+            except Exception as e:
+                print(f"Failed to add 'key_version' to credential_vault: {e}")
+
+        # Ensure no NULLs present (existing rows pre-ALTER may end up NULL)
+        try:
+            await self.execute("UPDATE credential_vault SET key_version = 1 WHERE key_version IS NULL")
+        except Exception:
+            pass
 
     async def execute(self, query: str, params: tuple = ()):
         """Execute a write query."""
