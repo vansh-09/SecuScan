@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 # Add repo root to sys.path so package imports work (backend.*)
 repo_root = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(repo_root))
+sys.path.insert(0, str(repo_root / "backend"))
 
 from backend.secuscan.config import settings
 from backend.secuscan import database as database_module
