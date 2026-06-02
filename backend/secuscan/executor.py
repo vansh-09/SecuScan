@@ -23,7 +23,7 @@ from .ratelimit import concurrent_limiter
 from .risk_scoring import compute_risk_score, compute_risk_factors
 from .capabilities import CapabilityEnforcer, CapabilityDeniedError, build_enforcer_from_settings
 from .parser_sandbox import run_parser_in_sandbox, ParserSandboxError
-
+from .network_policy import get_policy_engine
 
 def _parse_discovered_at(finding: dict) -> Optional[datetime]:
     """Extract and parse discovered_at from a finding dict, or return current UTC time."""
@@ -273,6 +273,74 @@ class TaskExecutor:
             safe_mode = bool(task_row["safe_mode"])
             target = extract_target(inputs)
 
+            # ── Safe Mode & Network policy enforcement ───────────────────────
+            # Enforce Safe Mode target validation inside TaskExecutor to guarantee
+            # that all execution paths (manual API, workflows, scheduled tasks) are protected.
+            if target:
+                plugin_manager = get_plugin_manager()
+                plugin = plugin_manager.get_plugin(plugin_id)
+                should_validate = True
+                if plugin and plugin.category == "code":
+                    should_validate = False
+
+                # Check for filesystem targets using the same best-effort detection
+                is_fs = target.startswith(("/", "./", "../", "~")) or \
+                        bool(re.match(r"^[A-Za-z]:[\\/]", target)) or \
+                        ("/" in target and not target.startswith(("http://", "https://")))
+
+                if should_validate and not is_fs:
+                    from .validation import validate_target
+                    try:
+                        # Enforce safe mode validation of target address in a thread pool
+                        is_valid, error_msg = await asyncio.wait_for(
+                            asyncio.to_thread(validate_target, target, safe_mode),
+                            timeout=float(settings.dns_resolution_timeout_seconds),
+                        )
+                        if not is_valid:
+                            await self.mark_task_failed(
+                                task_id,
+                                f"Safe mode target validation failed: {error_msg}",
+                            )
+                            await self._broadcast(task_id, "status", TaskStatus.FAILED.value)
+                            return
+                    except asyncio.TimeoutError:
+                        await self.mark_task_failed(
+                            task_id,
+                            "Target validation timed out (SecuScan Guardrail)",
+                        )
+                        await self._broadcast(task_id, "status", TaskStatus.FAILED.value)
+                        return
+
+            # Check before launching any scanner or subprocess.  check_access()
+            # writes an audit entry on every path, so no extra logging needed.
+            if target and settings.enforce_network_policy:
+                engine = get_policy_engine()
+                try:
+                    allowed, reason, _ = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            engine.check_access,
+                            dest_ip=target,
+                            plugin_id=plugin_id,
+                            task_id=task_id,
+                        ),
+                        timeout=float(settings.dns_resolution_timeout_seconds),
+                    )
+                except asyncio.TimeoutError:
+                    allowed, reason = False, "Network policy check timed out (DNS resolution timeout)"
+
+                if not allowed:
+                    if settings.network_policy_failure_mode == "log_only":
+                        logger.warning(
+                            f"[Log Only] Network policy violation allowed for {target}: {reason}"
+                        )
+                    else:
+                        await self.mark_task_failed(
+                            task_id,
+                            f"Network policy denied access to {target}: {reason}",
+                        )
+                        await self._broadcast(task_id, "status", TaskStatus.FAILED.value)
+                        return  # finally block handles running_tasks cleanup + limiter release
+
             # Check if this is a modular scanner or a standard plugin
             if plugin_id in MODULAR_SCANNERS:
                 scanner_class = MODULAR_SCANNERS[plugin_id]
@@ -344,6 +412,41 @@ class TaskExecutor:
 
                 # Apply Docker Sandboxing if enabled
                 if settings.docker_enabled:
+                    # Validate the named Docker network exists before using it.
+                    # If missing, attempt to create it automatically rather than failing.
+                    _net_check = await asyncio.create_subprocess_exec(
+                        "docker", "network", "inspect", settings.docker_network,
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                    )
+                    await _net_check.wait()
+                    if _net_check.returncode != 0:
+                        logger.info(f"Docker network '{settings.docker_network}' not found. Creating isolated bridge network (ICC disabled)...")
+                        _net_create = await asyncio.create_subprocess_exec(
+                            "docker", "network", "create",
+                            "--driver", "bridge",
+                            "--opt", "com.docker.network.bridge.enable_icc=false",
+                            settings.docker_network,
+                            stdout=asyncio.subprocess.DEVNULL,
+                            stderr=asyncio.subprocess.DEVNULL,
+                        )
+                        await _net_create.wait()
+                        if _net_create.returncode != 0:
+                            logger.warning("Failed to create isolated bridge network with ICC disabled. Falling back to standard bridge...")
+                            _net_create_fallback = await asyncio.create_subprocess_exec(
+                                "docker", "network", "create", "--driver", "bridge", settings.docker_network,
+                                stdout=asyncio.subprocess.DEVNULL,
+                                stderr=asyncio.subprocess.DEVNULL,
+                            )
+                            await _net_create_fallback.wait()
+                            if _net_create_fallback.returncode != 0:
+                                raise RuntimeError(
+                                    f"Docker network '{settings.docker_network}' does not exist and could not be created automatically."
+                                )
+                            logger.info(f"Successfully created Docker network '{settings.docker_network}' (fallback)")
+                        else:
+                            logger.info(f"Successfully created Docker network '{settings.docker_network}' with ICC disabled")
+
                     docker_image = plugin.docker_image or "alpine:latest"
                     docker_cmd = [
                         "docker",
@@ -355,6 +458,8 @@ class TaskExecutor:
                         f"{settings.sandbox_memory_mb}m",
                         "--cpus",
                         str(settings.sandbox_cpu_quota),
+                        "--cap-drop", "NET_RAW",
+                        "--network", settings.docker_network,
                         docker_image,
                     ]
                     command = docker_cmd + command
