@@ -4,7 +4,7 @@ API routes for SecuScan backend
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks, Response, Request, Depends, Body, Query
 from fastapi.responses import JSONResponse
-from typing import Any, Optional, List, Dict, Callable
+from typing import Any, Optional, List, Dict, Callable, cast
 import json
 import logging
 import re
@@ -81,11 +81,15 @@ def _parse_workflow_steps(raw_steps: Any) -> List[Dict[str, Any]]:
         if not isinstance(step, dict):
             continue
         try:
+            execution_context = cast(
+                ExecutionContext,
+                normalize_execution_context(step.get("execution_context") or {}),
+            )
             model = WorkflowStep(
                 plugin_id=str(step.get("plugin_id", "")),
                 inputs=step.get("inputs") or {},
                 preset=step.get("preset"),
-                execution_context=step.get("execution_context") or {},
+                execution_context=execution_context,
             )
         except Exception:
             continue
@@ -843,7 +847,10 @@ async def get_task_result(task_id: str, owner: str = Depends(get_current_owner))
     if not summary and total_findings > 0:
         critical_high = severity_counts.get("critical", 0) + severity_counts.get("high", 0)
         if critical_high > 0:
-            summary.append(f"Assessment identified {total_findings} security risks, including {critical_high} high-priority items requiring remediation.")
+            summary.append(
+                f"Assessment identified {total_findings} security risks, including {critical_high} high-priority items requiring remediation."
+            )
+
         else:
             summary.append(f"Assessment identified {total_findings} minor observations; no critical or high-severity threats were found.")
     elif not summary:
@@ -863,6 +870,11 @@ async def get_task_result(task_id: str, owner: str = Depends(get_current_owner))
                 raw_output = f.read(100000)
         except Exception:
             pass
+
+    # Pylance may infer `summary` as List[object] / List[int] based on
+    # `structured_summary` contents at type-check time. Coerce here so
+    # downstream `.extend(...)` calls are type-consistent.
+    summary = [str(s) for s in summary]
 
     return {
         "task_id": task_row["id"],
@@ -889,8 +901,10 @@ async def get_task_result(task_id: str, owner: str = Depends(get_current_owner))
         "errors": [{"message": task_row["error_message"]}] if task_row["error_message"] else [],
         "error_message": task_row["error_message"],
         "exit_code": task_row["exit_code"],
-        "metadata": {}
+        "metadata": {},
     }
+
+
 
 
 @router.post("/task/{task_id}/cancel")
@@ -985,9 +999,11 @@ async def get_dashboard_summary(owner: str = Depends(get_current_owner)):
             if "references_json" in finding:
                 finding["references"] = finding.pop("references_json")
 
-        risk_scores = [
-            f.get("risk_score") for f in recent_findings
-            if isinstance(f.get("risk_score"), (int, float))
+        risk_scores: List[float] = [
+            float(risk_score)
+            for f in recent_findings
+            for risk_score in [f.get("risk_score")]
+            if isinstance(risk_score, (int, float))
         ]
         avg_risk_score = round(sum(risk_scores) / len(risk_scores), 1) if risk_scores else None
 
@@ -1758,8 +1774,11 @@ async def run_workflow_once(workflow_id: str, owner: str = Depends(get_current_o
         effective_inputs = dict(step.get("inputs", {}) or {})
         effective_inputs.pop("safe_mode", None)
         effective_inputs["safe_mode"] = safe_mode
+        plugin_id = step.get("plugin_id")
+        if not plugin_id:
+            raise HTTPException(status_code=400, detail="Workflow step missing plugin_id")
         task_id = await executor.create_task(
-            step.get("plugin_id"),
+            str(plugin_id),
             effective_inputs,
             safe_mode=safe_mode,
             preset=step.get("preset"),
@@ -2249,7 +2268,7 @@ api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 def verify_admin_access(
     api_key: Optional[str] = Security(api_key_header),
-    request: Request = None,
+    request: Optional[Request] = None,
 ) -> Optional[str]:
     """Verify admin API key is provided and valid."""
     import hmac
